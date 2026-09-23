@@ -11,6 +11,12 @@ NC='\033[0m' # No Color
 # Scanning performance tuning (bytes)
 HEADER_BYTES=${HEADER_BYTES:-4194304}  # 4 MiB
 MIN_SIZE_BYTES=${MIN_SIZE_BYTES:-1024}  # ignore tiny files
+# Metadata repair reads further into a GGUF than HEADER_BYTES: past the whole
+# metadata block, which a 150k-entry vocabulary alone can push beyond 4 MiB, and
+# into the tensor table. 128 MiB covers every model tested and is read, not
+# buffered, so the cost is I/O on a file that was just downloaded anyway.
+GGUF_SCAN_BYTES=${GGUF_SCAN_BYTES:-134217728}  # 128 MiB
+REPAIR_MODEL_METADATA=${REPAIR_MODEL_METADATA:-1}  # 0 disables the repair entirely
 DOWNLOAD_RETRY_DELAY_SECONDS=${DOWNLOAD_RETRY_DELAY_SECONDS:-5}
 DOWNLOAD_MAX_RETRIES=${DOWNLOAD_MAX_RETRIES:-10}
 PATH_DISPLAY_WIDTH=${PATH_DISPLAY_WIDTH:-80}
@@ -282,8 +288,9 @@ registry_pull() {
         return 1
     fi
 
-    # Config blob first, then layers: the config is tiny and its absence is what
-    # makes `docker model ls` show a model with no metadata.
+    # Config blob first, then layers: it is tiny, and it is what `docker model ls`
+    # reads every column except the tag from. (Its *contents* are sometimes empty
+    # upstream - see the metadata repair below - but that is not a fetch problem.)
     for entry in $(jq -r '.config.digest, .layers[].digest' "$manifest_file" 2>/dev/null); do
         local label size
         size=$(jq -r --arg d "$entry" \
@@ -344,10 +351,442 @@ registry_pull() {
         return 1
     fi
 
+    repair_model_metadata "$store" "$digest" || true
+
     echo
     print_message "$GREEN" "✅ Installed ${repo}:${tag} into the Docker model store."
     print_message "$YELLOW" "Verify with: docker model ls"
     return 0
+}
+
+# --- Metadata repair -------------------------------------------------------
+#
+# Some tags on Docker Hub ship a config blob with nothing in it - literally
+# {"format":"gguf"} - and the Model Runner has nothing else to read, so
+# `docker model ls` lists the model with blank PARAMETERS, QUANTIZATION,
+# ARCHITECTURE and SIZE, and a CREATED of "56 years ago" (epoch 0).
+#
+# This is an upstream publishing defect, not a download problem. The blob we
+# fetch matches the digest that names it, and it is per-tag: ai/qwen3:8B-Q4_K_M
+# is fully populated while ai/qwen3:latest is empty. `docker model pull` lands
+# exactly the same empty blob, which is why the repair runs after both download
+# paths rather than only after the curl fallback.
+#
+# Everything the blob should have said is in the GGUF itself, so we read it back
+# out of the weights and write the config Docker should have published. Only a
+# blob that names no architecture is touched - a populated one is upstream's own
+# metadata and is never second-guessed.
+
+# general.file_type is llama.cpp's llama_ftype enum. These are the labels Docker
+# stores as "quantization"; a value with no entry here is left out rather than
+# guessed at.
+ftype_label() {
+    case "$1" in
+        0)  printf 'ALL_F32' ;;
+        1)  printf 'MOSTLY_F16' ;;
+        2)  printf 'MOSTLY_Q4_0' ;;
+        3)  printf 'MOSTLY_Q4_1' ;;
+        4)  printf 'MOSTLY_Q4_1_SOME_F16' ;;
+        7)  printf 'MOSTLY_Q8_0' ;;
+        8)  printf 'MOSTLY_Q5_0' ;;
+        9)  printf 'MOSTLY_Q5_1' ;;
+        10) printf 'MOSTLY_Q2_K' ;;
+        11) printf 'MOSTLY_Q3_K_S' ;;
+        12) printf 'MOSTLY_Q3_K_M' ;;
+        13) printf 'MOSTLY_Q3_K_L' ;;
+        14) printf 'MOSTLY_Q4_K_S' ;;
+        15) printf 'MOSTLY_Q4_K_M' ;;
+        16) printf 'MOSTLY_Q5_K_S' ;;
+        17) printf 'MOSTLY_Q5_K_M' ;;
+        18) printf 'MOSTLY_Q6_K' ;;
+        19) printf 'MOSTLY_IQ2_XXS' ;;
+        20) printf 'MOSTLY_IQ2_XS' ;;
+        21) printf 'MOSTLY_Q2_K_S' ;;
+        22) printf 'MOSTLY_IQ3_XS' ;;
+        23) printf 'MOSTLY_IQ3_XXS' ;;
+        24) printf 'MOSTLY_IQ1_S' ;;
+        25) printf 'MOSTLY_IQ4_NL' ;;
+        26) printf 'MOSTLY_IQ3_S' ;;
+        27) printf 'MOSTLY_IQ3_M' ;;
+        28) printf 'MOSTLY_IQ2_S' ;;
+        29) printf 'MOSTLY_IQ2_M' ;;
+        30) printf 'MOSTLY_IQ4_XS' ;;
+        31) printf 'MOSTLY_IQ1_M' ;;
+        32) printf 'MOSTLY_BF16' ;;
+        36) printf 'MOSTLY_TQ1_0' ;;
+        37) printf 'MOSTLY_TQ2_0' ;;
+        38) printf 'MOSTLY_MXFP4_MOE' ;;
+        *)  return 1 ;;
+    esac
+}
+
+# Read the GGUF binary header far enough to answer three questions the text
+# helpers above cannot: the architecture, the quantization enum (a binary u32,
+# invisible to `strings`), and the parameter count - which no GGUF stores, so it
+# has to be summed over every tensor's dimensions.
+#
+# od | awk rather than a real language: this script's dependency list is bash,
+# jq, awk, curl and shasum, and reading a header is not worth adding to it.
+# Emits KEY=VALUE lines; exits non-zero if the file is not a parseable GGUF.
+gguf_probe() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+
+    # od -v is mandatory: without it od collapses repeated lines to "*" and the
+    # byte stream silently loses content. head bounds the read so a 25 GB file
+    # costs only its header; awk exits as soon as the tensor table ends and the
+    # upstream pipe stages take SIGPIPE.
+    LC_ALL=C head -c "$GGUF_SCAN_BYTES" "$file" 2>/dev/null \
+        | LC_ALL=C od -An -v -tu1 2>/dev/null \
+        | LC_ALL=C awk '
+    # Explicit init is load-bearing: an uninitialised bi subscripts buf as the
+    # string "" while buf[bn++] subscripts it as the number 0, so the reader and
+    # the writer disagree about the very first byte.
+    BEGIN { bi = 0; bn = 0; bad = 0 }
+    function refill(   k) {
+        if ((getline) <= 0) { bad = 1; return 0 }
+        for (k = 1; k <= NF; k++) buf[bn++] = $k + 0
+        return 1
+    }
+    function b(   v) {
+        if (bi >= bn) { if (!refill()) return 0 }
+        v = buf[bi]; delete buf[bi]; bi++
+        if (bi >= bn) { bi = 0; bn = 0 }
+        return v
+    }
+    function uint(w,   i, v, m) {
+        v = 0; m = 1
+        for (i = 0; i < w; i++) { v += b() * m; m *= 256 }
+        return v
+    }
+    # Skipping is the hot path - a 150k-entry vocabulary is megabytes of strings
+    # nobody here reads. Whole od lines are swallowed without being turned into
+    # array elements, so skipping costs one getline per 16 bytes instead of one
+    # array store and delete per byte.
+    function skip(n,   k) {
+        while (n > 0 && bi < bn) { delete buf[bi]; bi++; n-- }
+        if (bi >= bn) { bi = 0; bn = 0 }
+        while (n > 0) {
+            if ((getline) <= 0) { bad = 1; return }
+            if (NF <= n) { n -= NF; continue }
+            for (k = 1; k <= NF; k++) buf[bn++] = $k + 0
+            while (n > 0) { delete buf[bi]; bi++; n-- }
+            return
+        }
+    }
+    function rdstr(   n, i, s) {
+        n = uint(8); s = ""
+        for (i = 0; i < n; i++) s = s sprintf("%c", b())
+        return s
+    }
+    function twidth(t) {
+        if (t == 0 || t == 1 || t == 7) return 1
+        if (t == 2 || t == 3) return 2
+        if (t == 4 || t == 5 || t == 6) return 4
+        if (t == 10 || t == 11 || t == 12) return 8
+        bad = 1; return 0
+    }
+    function skipval(t,   et, cnt, i) {
+        if (t == 8) { skip(uint(8)); return }
+        if (t == 9) {
+            et = uint(4); cnt = uint(8)
+            if (et == 9) { bad = 1; return }
+            if (et == 8) { for (i = 0; i < cnt && !bad; i++) skip(uint(8)); return }
+            skip(cnt * twidth(et)); return
+        }
+        skip(twidth(t))
+    }
+    function parse(   i, j, nd, key, t, nt, nkv, elems, ver) {
+        if (b() != 71 || b() != 71 || b() != 85 || b() != 70) { bad = 1; return }
+        ver = uint(4)
+        if (ver < 2 || ver > 3) { bad = 1; return }
+        nt = uint(8); nkv = uint(8)
+
+        arch = ""; ftype = -1; ctx = 0
+        for (i = 0; i < nkv && !bad; i++) {
+            key = rdstr()
+            t = uint(4)
+            if (key == "general.architecture" && t == 8)               arch = rdstr()
+            else if (key == "general.file_type" && (t == 4 || t == 5))  ftype = uint(4)
+            else if (key ~ /\.context_length$/ && (t == 4 || t == 5))  ctx = uint(4)
+            else skipval(t)
+        }
+        if (bad) return
+
+        # Parameter count is not stored anywhere in a GGUF; it is the sum over
+        # every tensor of the product of its dimensions.
+        params = 0
+        for (i = 0; i < nt && !bad; i++) {
+            skip(uint(8))                                  # tensor name
+            nd = uint(4)
+            elems = 1
+            for (j = 0; j < nd; j++) elems = elems * uint(8)
+            skip(12)                                       # ggml type + offset
+            params += elems
+        }
+        version = ver; tensors = nt; kv = nkv
+    }
+    NR == 1 {
+        for (k = 1; k <= NF; k++) buf[bn++] = $k + 0
+        parse()
+        if (bad || arch == "") exit 1
+        # %.0f, not %d: parameter counts exceed the 32-bit range awk %d truncates to.
+        printf "version=%d\ntensors=%d\nkv=%d\narch=%s\nfile_type=%d\nparams=%.0f\ncontext=%d\n",
+            version, tensors, kv, arch, ftype, params, ctx
+        exit 0
+    }
+    ' 2>/dev/null
+}
+
+gguf_probe_field() {
+    printf '%s\n' "$1" | awk -F= -v k="$2" '$1 == k { print $2; exit }'
+}
+
+# Which layer holds the weights, in three fallbacks, because the store spans two
+# media-type generations and upstream annotates inconsistently:
+#   1. the old dedicated gguf media type;
+#   2. a CNCF weight layer whose filepath annotation ends in .gguf - needed
+#      because a multimodal projector (model.mmproj) is typed as a weight layer
+#      too and must not be picked;
+#   3. the largest weight layer, for manifests that carry no filepath
+#      annotations at all.
+# Empty when the model has no GGUF at all, which is how a diffusers .dduf model
+# gets skipped instead of mis-parsed.
+manifest_gguf_digest() {
+    local manifest="$1"
+    jq -r '
+        ( [ .layers[]
+            | select(.mediaType == "application/vnd.docker.ai.gguf.v3") ]
+          | sort_by(-.size) | .[0].digest )
+        // ( [ .layers[]
+               | select((.annotations["org.cncf.model.filepath"] // "") | endswith(".gguf")) ]
+             | sort_by(-.size) | .[0].digest )
+        // ( [ .layers[]
+               | select(.mediaType | test("weight|gguf")) ]
+             | sort_by(-.size) | .[0].digest )
+        // empty
+    ' "$manifest" 2>/dev/null
+}
+
+# True when the config names no architecture, in either schema generation: the
+# older flat one and the nested "config" object both put it somewhere we look.
+config_blob_is_blank() {
+    local blob="$1" arch
+    [ -f "$blob" ] || return 0
+    arch=$(jq -r '(.config.architecture // .architecture) // empty' "$blob" 2>/dev/null) || arch=""
+    [ -z "$arch" ]
+}
+
+# When the weights landed on this machine is the honest creation date for a blob
+# we are synthesising now. Both stat and date differ between BSD and GNU, hence
+# the pairs.
+gguf_created_at() {
+    local file="$1" epoch stamp
+    epoch=$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null) || epoch=""
+    [ -n "$epoch" ] || epoch=$(date -u +%s)
+    stamp=$(date -u -r "$epoch" +%Y-%m-%dT%H:%M:%S 2>/dev/null \
+            || date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%S 2>/dev/null) || stamp=""
+    [ -n "$stamp" ] || stamp=$(date -u +%Y-%m-%dT%H:%M:%S)
+    # The Model Runner writes nanoseconds here; seconds padded out parse the same.
+    printf '%s.000000000Z' "$stamp"
+}
+
+# Synthesise the config blob for one model and walk the cascade a new config
+# digest forces: blob -> manifest -> manifest digest -> models.json id and file
+# list -> the bundle directory, which is named after the manifest digest too.
+#
+# Returns 0 when it repaired something, 2 when there was nothing to do (the
+# common case - it runs after every download), 1 when it tried and failed. A
+# failure here never fails a download: the model still works, it just lists
+# without its metadata, exactly as it would have before.
+repair_model_metadata() {
+    local store="$1" manifest_digest="$2"
+    local manifest config_ref config_blob gguf_ref gguf info
+    local arch ftype params quant paramsize created diffids
+    local tmp_config tmp_manifest new_config_digest new_config_size
+    local new_manifest_digest backup old_bundle new_bundle files
+
+    [ "${REPAIR_MODEL_METADATA:-1}" = "1" ] || return 2
+
+    manifest="$store/manifests/sha256/$manifest_digest"
+    [ -f "$manifest" ] || return 2
+
+    config_ref=$(jq -r '.config.digest // empty' "$manifest" 2>/dev/null) || return 2
+    [ -n "$config_ref" ] || return 2
+    config_blob="$store/blobs/sha256/${config_ref#sha256:}"
+
+    config_blob_is_blank "$config_blob" || return 2
+
+    gguf_ref=$(manifest_gguf_digest "$manifest")
+    [ -n "$gguf_ref" ] || return 2
+    gguf="$store/blobs/sha256/${gguf_ref#sha256:}"
+    [ -f "$gguf" ] || return 2
+
+    echo
+    print_message "$YELLOW" "This model was published with an empty metadata blob, so it would list"
+    print_message "$YELLOW" "with no architecture, parameters or quantization. Reading them from the GGUF."
+
+    start_spinner "  parsing GGUF header"
+    info=$(gguf_probe "$gguf") || info=""
+    stop_spinner
+
+    if [ -z "$info" ]; then
+        print_message "$RED" "  Could not read the GGUF header - leaving the metadata alone."
+        return 1
+    fi
+
+    arch=$(gguf_probe_field "$info" arch)
+    ftype=$(gguf_probe_field "$info" file_type)
+    params=$(gguf_probe_field "$info" params)
+    if [ -z "$arch" ] || [ -z "$params" ] || [ "$params" = "0" ]; then
+        print_message "$RED" "  The GGUF header names no architecture - leaving the metadata alone."
+        return 1
+    fi
+
+    quant=$(ftype_label "${ftype:--1}") || quant=""
+    paramsize=$(awk -v p="$params" 'BEGIN { printf "%.2fB", p / 1000000000 }')
+    created=$(gguf_created_at "$gguf")
+    diffids=$(jq -c '[.layers[].digest]' "$manifest" 2>/dev/null) || diffids=""
+    [ -n "$diffids" ] || return 1
+
+    # Mirror the schema and key order the Model Runner writes for itself. Two
+    # fields are deliberately absent, both because the Runner omits them too:
+    #   size        - inert in this schema; the Runner renders paramSize instead.
+    #   context_size - would become a runtime default, and a model advertising a
+    #                  million tokens must not silently get one.
+    # quantization is left out rather than guessed when file_type is unknown.
+    tmp_config="$store/blobs/sha256/.$$.config.part"
+    if ! jq -cn --arg created "$created" --arg arch "$arch" \
+            --arg paramsize "$paramsize" --arg quant "$quant" --argjson diffids "$diffids" '
+            {
+              descriptor: { createdAt: $created, family: $arch },
+              modelfs: { type: "layers", diffIds: $diffids },
+              config: ({ architecture: $arch, format: "gguf", paramSize: $paramsize }
+                       + (if $quant == "" then {} else { quantization: $quant } end))
+            }' > "$tmp_config" 2>/dev/null; then
+        rm -f "$tmp_config" 2>/dev/null || true
+        print_message "$RED" "  Could not build the metadata blob - leaving it alone."
+        return 1
+    fi
+
+    new_config_digest=$(shasum -a 256 "$tmp_config" 2>/dev/null | awk '{print $1}')
+    new_config_size=$(wc -c < "$tmp_config" 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$new_config_digest" ] || [ -z "$new_config_size" ]; then
+        rm -f "$tmp_config" 2>/dev/null || true
+        return 1
+    fi
+
+    tmp_manifest="$store/manifests/sha256/.$$.manifest.part"
+    if ! jq -c --arg d "sha256:$new_config_digest" --argjson s "$new_config_size" \
+            '.config.digest = $d | .config.size = $s' \
+            "$manifest" > "$tmp_manifest" 2>/dev/null; then
+        rm -f "$tmp_config" "$tmp_manifest" 2>/dev/null || true
+        print_message "$RED" "  Could not rewrite the manifest - leaving the metadata alone."
+        return 1
+    fi
+    new_manifest_digest=$(shasum -a 256 "$tmp_manifest" 2>/dev/null | awk '{print $1}')
+    files=$(jq -c --arg c "sha256:$new_config_digest" '[$c] + [.layers[].digest]' "$tmp_manifest" 2>/dev/null)
+    if [ -z "$new_manifest_digest" ] || [ -z "$files" ]; then
+        rm -f "$tmp_config" "$tmp_manifest" 2>/dev/null || true
+        return 1
+    fi
+
+    # Back the mutable state up before touching any of it. The weights are never
+    # written to, so they need no backup and nothing here copies gigabytes.
+    backup=$(mktemp -d -t ddm_metadata 2>/dev/null) || backup=""
+    if [ -n "$backup" ]; then
+        cp -p "$store/models.json" "$backup/models.json" 2>/dev/null || true
+        cp -p "$manifest" "$backup/manifest-$manifest_digest" 2>/dev/null || true
+        cp -p "$config_blob" "$backup/config-${config_ref#sha256:}" 2>/dev/null || true
+        cat > "$backup/RESTORE.txt" <<EOF
+Undo the metadata repair of manifest $manifest_digest:
+
+  S="$store"
+  cp "$backup/models.json" "\$S/models.json"
+  cp "$backup/manifest-$manifest_digest" "\$S/manifests/sha256/$manifest_digest"
+  cp "$backup/config-${config_ref#sha256:}" "\$S/blobs/sha256/${config_ref#sha256:}"
+  [ -d "\$S/bundles/sha256/$new_manifest_digest" ] && mv "\$S/bundles/sha256/$new_manifest_digest" "\$S/bundles/sha256/$manifest_digest"
+  cp "$backup/config-${config_ref#sha256:}" "\$S/bundles/sha256/$manifest_digest/config.json" 2>/dev/null
+  rm -f "\$S/manifests/sha256/$new_manifest_digest" "\$S/blobs/sha256/$new_config_digest"
+
+The weights are untouched by the repair and need no restore.
+EOF
+    fi
+
+    # Additive writes first: nothing references either of these yet, so a failure
+    # here leaves the model exactly as it was, just with two unnamed extra files.
+    if ! mv -f "$tmp_config" "$store/blobs/sha256/$new_config_digest" \
+       || ! mv -f "$tmp_manifest" "$store/manifests/sha256/$new_manifest_digest"; then
+        rm -f "$tmp_config" "$tmp_manifest" 2>/dev/null || true
+        print_message "$RED" "  Could not write the new metadata into the store."
+        return 1
+    fi
+
+    # The bundle directory is named after the manifest digest and holds a copy of
+    # the config plus hardlinks to the weights, so renaming it moves no data. It
+    # is created lazily on first run, so it is often simply absent.
+    old_bundle="$store/bundles/sha256/$manifest_digest"
+    new_bundle="$store/bundles/sha256/$new_manifest_digest"
+    if [ -d "$old_bundle" ] && [ ! -d "$new_bundle" ]; then
+        if mv "$old_bundle" "$new_bundle" 2>/dev/null; then
+            cp "$store/blobs/sha256/$new_config_digest" "$new_bundle/config.json" 2>/dev/null || true
+        fi
+    fi
+
+    # The commit point: until models.json names the new manifest, none of the
+    # above is visible to the Model Runner.
+    if jq --arg old "sha256:$manifest_digest" \
+          --arg new "sha256:$new_manifest_digest" \
+          --argjson files "$files" \
+          '.models |= map(if .id == $old then (.id = $new | .files = $files) else . end)' \
+          "$store/models.json" > "$store/.models.json.part" 2>/dev/null; then
+        mv -f "$store/.models.json.part" "$store/models.json"
+    else
+        rm -f "$store/.models.json.part" 2>/dev/null || true
+        print_message "$RED" "  Could not update models.json - metadata left unrepaired."
+        return 1
+    fi
+
+    # The superseded manifest is now unreferenced and is uniquely this model's,
+    # so it goes. The old config blob stays: two models published with the same
+    # empty blob share one digest, and deleting it would blank the other one.
+    rm -f "$manifest" 2>/dev/null || true
+
+    print_message "$GREEN" "  ${arch}, ${paramsize} parameters${quant:+, $quant}"
+    [ -n "$backup" ] && print_message "$YELLOW" "  Previous metadata backed up in $backup"
+    return 0
+}
+
+# Resolve a user-supplied reference the way registry_pull does, to the tag form
+# models.json stores.
+normalize_model_tag() {
+    local reference="$1" repo tag
+    # Split on the last colon only if it is in the tag, not in a registry:port.
+    case "${reference##*/}" in
+        *:*) repo="${reference%:*}"; tag="${reference##*:}" ;;
+        *)   repo="$reference";      tag="latest" ;;
+    esac
+    case "$repo" in */*) : ;; *) repo="ai/$repo" ;; esac
+    case "$repo" in *.*/*|localhost/*) : ;; *) repo="docker.io/$repo" ;; esac
+    printf '%s:%s' "$repo" "$tag"
+}
+
+# Repair whichever model a reference names. Used after `docker model pull`,
+# which reports success without saying what it wrote where.
+repair_pulled_model() {
+    local reference="$1" store want id
+    [ "${REPAIR_MODEL_METADATA:-1}" = "1" ] || return 2
+
+    store="$(model_store_dir)"
+    [ -f "$store/models.json" ] || return 2
+
+    want=$(normalize_model_tag "$reference")
+    id=$(jq -r --arg t "$want" '
+            [ .models[] | select((.tags // []) | index($t)) | .id ] | .[0] // empty
+        ' "$store/models.json" 2>/dev/null) || id=""
+    [ -n "$id" ] || return 2
+
+    repair_model_metadata "$store" "${id#sha256:}"
 }
 
 pull_model_with_retries() {
@@ -404,6 +843,9 @@ pull_model_with_retries() {
 
         if [ "$status" -eq 0 ]; then
             rm -f "$log" 2>/dev/null || true
+            # A successful pull is no guarantee of usable metadata: some tags are
+            # published with an empty config blob and land here blank.
+            repair_pulled_model "$model_reference" || true
             return 0
         fi
 

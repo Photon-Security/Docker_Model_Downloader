@@ -36,6 +36,7 @@ Donate to support this work: [Ko-fi Enelass](https://ko-fi.com/enelass)
 - **Progressive load**: the table appears in about 10 seconds while per-model sizes keep downloading in the background behind a progress bar; `[u]` folds in whatever has landed so far.
 - **Recover from flaky pulls**: retries `docker model pull` failures automatically, which helps on unreliable or corporate networks.
 - **Survive a proxy that Docker's Model Runner ignores**: when a pull fails because the runner cannot resolve the registry, the script downloads the model itself with curl and installs it into Docker's model store. See [Proxied networks](#proxied-networks).
+- **Repair blank metadata**: some tags are published with an empty config blob, so `docker model ls` shows the model with no parameters, quantization or architecture and a **CREATED** of *56 years ago*. The script reads those facts back out of the GGUF and writes the metadata Docker should have shipped. See [Blank metadata in `docker model ls`](#blank-metadata-in-docker-model-ls).
 - **Inspect local downloads**: scan `~/.docker/models/blobs/sha256/` for completed GGUF blobs, list incomplete downloads separately, and show useful metadata such as role, architecture, size, context length, quantization, tensor count, and cropped path.
 - **Use optional llama.cpp metadata tooling**: detects `llama-gguf` from `brew install llama.cpp`, while still using `gguf_dump` when available. Downloads do not require either tool.
 - **Reuse Docker GGUF blobs elsewhere**: prints Ollama import commands and file locations so downloaded Docker models can be used with Ollama, llama.cpp, or other GGUF-compatible runtimes.
@@ -74,6 +75,7 @@ bash <(curl -s https://raw.githubusercontent.com/Enelass/Docker_Model_Downloader
 - Filters vLLM-only entries on macOS because they are not compatible there
 - Checks locally downloaded Docker GGUF blobs without starting a download, including grouped metadata, cropped paths, incomplete downloads, and an optional purge action
 - Retries failed model downloads automatically
+- Rebuilds missing model-store metadata from the GGUF header when a tag is published with an empty config blob
 - Allows cancelling an active download with Ctrl+C and returning to variant selection
 - Shows spinner feedback while retrieving models, variants, and local metadata
 - Automatic GGUF file detection with `llama-gguf` or `gguf_dump`
@@ -122,6 +124,7 @@ Everything in the table is derived from public APIs at runtime and cached for 7 
 | Memory bandwidth | built-in lookup table keyed on the chip string | M4 Pro 273 GB/s, M4 Max 546 GB/s, RTX 4090 1008 GB/s, … Unknown chip → tok/s shows `-` rather than a fabricated number |
 | tok/s | **computed, not fetched** | See [Fit and tok/s](#fit-and-toks) |
 | Local blob metadata | `~/.docker/models/blobs/sha256/`, read with `llama-gguf` or `gguf_dump` when installed | Architecture, context length, quantization, tensor count |
+| Metadata written back into the model store | the GGUF header, parsed with `od` and `awk` | Only when the registry published an empty config blob — see [Blank metadata in `docker model ls`](#blank-metadata-in-docker-model-ls) |
 
 Caches: `param-ranges-v3.tsv` (one tab-separated record per model: name, parameter range,
 smallest GGUF bytes, that tag, MoE active percentage) and `models-dev.json`. Delete either
@@ -155,7 +158,66 @@ at `~/.docker/models`:
 
 A model installed this way is indistinguishable from a pulled one — it appears in
 `docker model ls` with correct parameters, quantization and architecture, runs under
-`docker model run`, and removes cleanly with `docker model rm`.
+`docker model run`, and removes cleanly with `docker model rm`. Where the registry itself
+publishes no metadata, the next section fills it in; that gap affects `docker model pull`
+identically and is not a side effect of taking the curl path.
+
+## Blank metadata in `docker model ls`
+
+Some tags on Docker Hub ship a config blob with nothing in it — literally
+`{"format":"gguf"}` — and the Model Runner has nothing else to read:
+
+```
+MODEL NAME                     PARAMETERS  QUANTIZATION  ARCHITECTURE  SIZE  CREATED
+ai/nemotron-3.5-lightning                                                    56 years ago
+```
+
+Those blank columns are an **upstream publishing defect**, not a failed download. The blob
+matches the digest that names it, so nothing is corrupt, and it is decided **per tag**:
+`ai/qwen3:8B-Q4_K_M` is fully populated while `ai/qwen3:latest` is empty. `docker model
+pull` lands exactly the same empty blob, which is why the repair runs after both download
+paths rather than only after the curl fallback. `56 years ago` is Unix epoch 0 rendered as
+a relative date.
+
+Everything the blob should have said is in the GGUF, so the script reads it back out of the
+weights and writes the config Docker should have published:
+
+| Field | Where it comes from |
+|---|---|
+| `architecture`, `family` | `general.architecture` in the GGUF header |
+| `quantization` | `general.file_type`, mapped through the `llama_ftype` enum (`15` → `MOSTLY_Q4_K_M`) |
+| `paramSize` | **computed** — the sum over every tensor of the product of its dimensions, which is the only place a parameter count exists; GGUF does not store one |
+| `diffIds` | the manifest's own layer digests |
+| `createdAt` | the weight blob's mtime — when the artifact actually arrived on this machine |
+
+Two fields are deliberately left out. `size` is inert in this schema: the Model Runner
+derives the **SIZE** column from `paramSize` and silently drops any `size` key. And
+`context_size` is omitted because a model advertising a 1,048,576-token context must not
+have that become a runtime default here.
+
+Only a blob that names **no architecture** is touched. A populated config is upstream's own
+metadata and is never second-guessed, so the repair is a no-op on a healthy store, and
+models with no GGUF to read (`ai/stable-diffusion` ships a `.dduf`) are skipped in silence.
+Header parsing needs only `od` and `awk`, so this adds no dependency.
+
+Rewriting the config changes its digest, which cascades: the manifest's config descriptor
+changes, so the manifest digest changes, so the `models.json` entry and the bundle
+directory name change with it. The script walks that whole chain, writes each file as
+`.part` and `mv`s it into place, and takes the `models.json` swap as the commit point. The
+bundle's weights are hardlinks, so renaming its directory moves no data. Before anything is
+written, `models.json`, the manifest and the old config blob are copied to a `mktemp -d`
+directory alongside a generated `RESTORE.txt` that undoes the change verbatim. The weights
+are never touched.
+
+Two environment variables tune it:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `REPAIR_MODEL_METADATA` | `1` | `0` disables the repair entirely |
+| `GGUF_SCAN_BYTES` | `134217728` (128 MiB) | How far into the GGUF the header parser may read. It must pass the whole metadata block — a 150k-entry vocabulary alone can exceed 4 MiB — and into the tensor table |
+
+A repair failure never fails a download: the model is already on disk and usable, it just
+keeps the blank row it would have had anyway.
 
 ## Navigation
 
